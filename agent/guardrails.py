@@ -177,7 +177,10 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    if not isinstance(text, str) or not text:
+        return InjectionScanResult(suspicious=False, matched_patterns=())
+    matches = tuple(name for name, pattern in _INJECTION_PATTERNS if pattern.search(text))
+    return InjectionScanResult(suspicious=bool(matches), matched_patterns=matches)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +208,20 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    if not isinstance(text, str):
+        return RedactionResult(redacted_text="", hits=("non-string answer",))
+    patterns = (
+        ("api-key", re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_\-]{16,}\b")),
+        ("bearer-token", re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{16,}\b", re.I)),
+        ("password", re.compile(r"\bpassword\s*[:=]\s*\S+", re.I)),
+    )
+    hits: list[str] = []
+    redacted = text
+    for name, pattern in patterns:
+        if pattern.search(redacted):
+            hits.append(name)
+            redacted = pattern.sub("[REDACTED]", redacted)
+    return RedactionResult(redacted_text=redacted, hits=tuple(hits))
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +237,12 @@ class ArithmeticCheckResult:
 
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ignore-prior-instructions", re.compile(r"\bignore (?:all |any |the )?(?:previous|prior|above) instructions\b", re.I)),
+    ("fake-system-authority", re.compile(r"\b(?:as|i am) (?:the )?system\b|\bsystem prompt\b", re.I)),
+    ("credential-request", re.compile(r"\b(?:reveal|exfiltrate|send|print)\b.{0,80}\b(?:secret|token|password|credential|api key)\b", re.I)),
+    ("cross-learner-request", re.compile(r"\b(?:all|another|other) learners?\b|\bctx\.(?:act|scopes)\b", re.I)),
+)
 
 
 def verify_arithmetic(text: str) -> ArithmeticCheckResult:
@@ -238,9 +260,26 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
-    return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
-    )
+    if not isinstance(text, str):
+        return ArithmeticCheckResult(checked=False, ok=None, detail="answer is not text")
+    equations = re.findall(r"(-?\d+(?:\.\d+)?)\s*([+\-*/])\s*(-?\d+(?:\.\d+)?)\s*=\s*(-?\d+(?:\.\d+)?)", text)
+    if not equations:
+        return ArithmeticCheckResult(checked=False, ok=None, detail="no explicit arithmetic expression")
+    for left, op, right, claimed in equations:
+        a, b, c = float(left), float(right), float(claimed)
+        if op == "+":
+            value = a + b
+        elif op == "-":
+            value = a - b
+        elif op == "*":
+            value = a * b
+        elif b == 0:
+            return ArithmeticCheckResult(checked=True, ok=False, detail="division by zero")
+        else:
+            value = a / b
+        if abs(value - c) > 1e-9:
+            return ArithmeticCheckResult(checked=True, ok=False, detail=f"{left} {op} {right} != {claimed}")
+    return ArithmeticCheckResult(checked=True, ok=True, detail="all explicit arithmetic expressions agree")
 
 
 # ---------------------------------------------------------------------------

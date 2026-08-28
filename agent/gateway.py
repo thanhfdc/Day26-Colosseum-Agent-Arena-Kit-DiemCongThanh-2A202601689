@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -376,7 +376,11 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        routed = cmd
+        rewritten = False
+        if (cmd.server, cmd.tool) == ("slides", "search"):
+            routed = replace(cmd, tool="query")
+            rewritten = True
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +392,9 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        if routed.server == "slides" and routed.tool == "get_frame":
+            if not routed.lease_id or routed.lease_id not in self.ctx.leases:
+                return self.deny(cmd, "slides.get_frame requires a live lease")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -402,8 +408,20 @@ class Gateway:
         # `verify_delegation` is the real worked example of an authority
         # check over a signed token, for the A2A-specific version of this
         # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        is_write = (routed.server, routed.tool) in {
+            ("progress", "record_mastery"),
+            ("content", "flag_stale_slide"),
+        }
+        if is_write:
+            target = routed.args.get("learner", routed.args.get("act"))
+            if isinstance(target, str) and target != self.ctx.act:
+                return self.deny(cmd, "write target is outside ctx.act")
+            required_scope = f"wiki.write:{routed.server}"
+            if required_scope not in self.ctx.scopes:
+                return self.deny(cmd, f"missing required scope {required_scope}")
+            headers = {str(k).lower(): v for k, v in routed.headers.items()}
+            if not headers.get("if-match") or not headers.get("idempotency-key"):
+                return self.deny(cmd, "writes require If-Match and Idempotency-Key")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
@@ -420,8 +438,22 @@ class Gateway:
         # starter: never rewrites a mask and never paces spend — it trusts
         # the model's own field mask exactly as written, every time.
 
+        if routed.fields in ((), ("*",)):
+            cheap_defaults = {
+                ("registry", "list_servers"): ("name",),
+                ("glossary", "list_terms"): ("term",),
+            }
+            cheap = cheap_defaults.get((routed.server, routed.tool))
+            if cheap is not None:
+                routed = replace(routed, fields=cheap)
+                rewritten = True
+
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(
+            verdict="rewrite" if rewritten else "forward",
+            call=call,
+            note="gateway narrowed or modernised the requested call" if rewritten else None,
+        )
         self._telemetry.decision_made(cmd, decision)
         return decision
 
